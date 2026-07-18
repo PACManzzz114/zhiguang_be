@@ -4,12 +4,14 @@ import com.alibaba.otter.canal.client.CanalConnector;
 import com.alibaba.otter.canal.client.CanalConnectors;
 import com.alibaba.otter.canal.protocol.CanalEntry;
 import com.alibaba.otter.canal.protocol.Message;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.SmartLifecycle;
 import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.support.SendResult;
 import org.springframework.core.task.TaskExecutor;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Service;
@@ -17,6 +19,10 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.net.InetSocketAddress;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
+import java.util.concurrent.CompletableFuture;
 
 /**
  * Canal→Kafka 桥接器。
@@ -114,51 +120,93 @@ public class CanalKafkaBridge implements SmartLifecycle {
                         } catch (InterruptedException ignored) {}
                         continue;
                     }
-                    for (CanalEntry.Entry entry : message.getEntries()) {
-                        // 仅处理行级数据变更事件
-                        if (entry.getEntryType() != CanalEntry.EntryType.ROWDATA) {
-                            continue;
-                        }
-                        CanalEntry.RowChange rowChange;
+                    try {
+                        List<CompletableFuture<SendResult<String, String>>> sendFutures = new ArrayList<>();
 
-                        try {
-                            // 解析二进制为 RowChange（包含 INSERT/UPDATE 的行变更）
-                            rowChange = CanalEntry.RowChange.parseFrom(entry.getStoreValue());
-                        } catch (Exception e) {
-                            continue;
-                        }
-
-                        CanalEntry.EventType eventType = rowChange.getEventType();
-                        // 仅转发 INSERT/UPDATE 事件，忽略其他类型
-                        if (eventType != CanalEntry.EventType.INSERT && eventType != CanalEntry.EventType.UPDATE) {
-                            continue;
-                        }
-                        ArrayNode dataArray = objectMapper.createArrayNode();
-
-                        for (CanalEntry.RowData rowData : rowChange.getRowDatasList()) {
-                            ObjectNode rowNode = objectMapper.createObjectNode();
-                            for (CanalEntry.Column col : rowData.getAfterColumnsList()) {
-                                // 提取 payload 字段值（JSON 字符串），供下游消费
-                                if ("payload".equalsIgnoreCase(col.getName())) {
-                                    rowNode.put("payload", col.getValue());
-                                }
+                        for (CanalEntry.Entry entry : message.getEntries()) {
+                            // 仅处理行级数据变更事件
+                            if (entry.getEntryType() != CanalEntry.EntryType.ROWDATA) {
+                                continue;
                             }
-                            dataArray.add(rowNode);
+
+                            CanalEntry.RowChange rowChange;
+                            try {
+                                // 解析失败时保留当前 Canal 位点，避免静默跳过 Outbox 事件
+                                rowChange = CanalEntry.RowChange.parseFrom(entry.getStoreValue());
+                            } catch (Exception e) {
+                                throw new IllegalStateException("Failed to parse Canal row change", e);
+                            }
+
+                            CanalEntry.EventType eventType = rowChange.getEventType();
+                            // Outbox 只依赖 INSERT/UPDATE；其他事件不需要转发
+                            if (eventType != CanalEntry.EventType.INSERT && eventType != CanalEntry.EventType.UPDATE) {
+                                continue;
+                            }
+
+                            for (CanalEntry.RowData rowData : rowChange.getRowDatasList()) {
+                                ObjectNode rowNode = objectMapper.createObjectNode();
+                                String outboxId = null;
+                                String aggregateType = null;
+                                String aggregateId = null;
+                                String payload = null;
+
+                                for (CanalEntry.Column col : rowData.getAfterColumnsList()) {
+                                    String name = col.getName().toLowerCase(Locale.ROOT);
+                                    String value = col.getIsNull() ? null : col.getValue();
+
+                                    switch (name) {
+                                        case "id" -> outboxId = value;
+                                        case "aggregate_type" -> aggregateType = value;
+                                        case "aggregate_id" -> aggregateId = value;
+                                        case "type" -> rowNode.put("eventType", value);
+                                        case "payload" -> payload = value;
+                                        default -> {
+                                        }
+                                    }
+                                }
+
+                                if (payload == null || payload.isBlank()) {
+                                    throw new IllegalStateException("Outbox row is missing payload: " + outboxId);
+                                }
+
+                                rowNode.put("id", outboxId);
+                                rowNode.put("aggregateType", aggregateType);
+                                if (aggregateId == null) {
+                                    rowNode.putNull("aggregateId");
+                                } else {
+                                    rowNode.put("aggregateId", aggregateId);
+                                }
+                                rowNode.put("payload", payload);
+
+                                ArrayNode dataArray = objectMapper.createArrayNode();
+                                dataArray.add(rowNode);
+
+                                ObjectNode msgNode = objectMapper.createObjectNode();
+                                msgNode.put("table", entry.getHeader().getTableName());
+                                msgNode.put("type", eventType == CanalEntry.EventType.INSERT ? "INSERT" : "UPDATE");
+                                msgNode.set("data", dataArray);
+
+                                String messageKey = buildMessageKey(aggregateType, aggregateId, outboxId, payload);
+                                String json = objectMapper.writeValueAsString(msgNode);
+                                sendFutures.add(kafka.send(OutboxTopics.CANAL_OUTBOX, messageKey, json));
+                            }
                         }
 
-                        ObjectNode msgNode = objectMapper.createObjectNode();
-                        msgNode.put("table", entry.getHeader().getTableName());
-                        msgNode.put("type", eventType == CanalEntry.EventType.INSERT ? "INSERT" : "UPDATE");
-                        msgNode.set("data", dataArray);
-
+                        // 只有当前批次的 Kafka 消息全部发送成功，才推进 Canal 位点
+                        awaitKafkaDeliveryAndAck(connector, batchId, sendFutures);
+                    } catch (Exception batchError) {
                         try {
-                            // 序列化并发送到 Kafka 主题（canal-outbox）
-                            String json = objectMapper.writeValueAsString(msgNode);
-                            kafka.send(OutboxTopics.CANAL_OUTBOX, json);
-                        } catch (Exception ignored) {}
+                            connector.rollback(batchId);
+                        } catch (Exception rollbackError) {
+                            log.error("Canal batch rollback failed: batchId={}", batchId, rollbackError);
+                        }
+                        log.warn("Canal batch delivery failed and will be retried: batchId={}", batchId, batchError);
+                        try {
+                            Thread.sleep(intervalMs);
+                        } catch (InterruptedException interrupted) {
+                            Thread.currentThread().interrupt();
+                        }
                     }
-                    // 批次确认（推进位点），避免消息重放
-                    connector.ack(batchId);
                 }
             } catch (Exception e) {
                 log.error("Canal bridge error", e);
@@ -174,6 +222,48 @@ public class CanalKafkaBridge implements SmartLifecycle {
                 }
             }
         });
+    }
+
+    /**
+     * 为同一业务实体生成稳定的 Kafka key，保证多分区下的事件顺序。
+     * 关注事件按双方用户维度分区，其他事件优先按聚合类型和聚合 ID 分区。
+     */
+    String buildMessageKey(String aggregateType, String aggregateId, String outboxId, String payload) {
+        if ("following".equalsIgnoreCase(aggregateType)) {
+            try {
+                JsonNode relationEvent = objectMapper.readTree(payload);
+                JsonNode fromUserId = relationEvent.get("fromUserId");
+                JsonNode toUserId = relationEvent.get("toUserId");
+                if (fromUserId != null && toUserId != null) {
+                    return "following:" + fromUserId.asText() + ":" + toUserId.asText();
+                }
+            } catch (Exception e) {
+                throw new IllegalStateException("Failed to build Kafka key from relation event", e);
+            }
+        }
+
+        if (aggregateType != null && !aggregateType.isBlank()
+                && aggregateId != null && !aggregateId.isBlank()) {
+            return aggregateType + ":" + aggregateId;
+        }
+
+        if (outboxId != null && !outboxId.isBlank()) {
+            return "outbox:" + outboxId;
+        }
+
+        throw new IllegalStateException("Cannot build Kafka key for Outbox event");
+    }
+
+    /**
+     * 等待当前 Canal 批次对应的 Kafka Future 全部完成，再确认 Canal 位点。
+     * 任一 Future 失败都会在 ack 前抛出异常，由调用方回滚当前批次。
+     */
+    void awaitKafkaDeliveryAndAck(CanalConnector currentConnector,
+                                  long batchId,
+                                  List<CompletableFuture<SendResult<String, String>>> sendFutures) {
+        CompletableFuture<?>[] futures = sendFutures.toArray(CompletableFuture[]::new);
+        CompletableFuture.allOf(futures).join();
+        currentConnector.ack(batchId);
     }
 
     /**
