@@ -26,10 +26,13 @@ import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Collections;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -131,7 +134,7 @@ public class KnowPostServiceImpl implements KnowPostService {
             throw new BusinessException(ErrorCode.BAD_REQUEST, "草稿不存在或无权限");
         }
 
-        invalidateCache(id);
+        invalidateCacheAfterCommit(id);
 
         // 触发一次预索引（草稿阶段可能因可见性/状态被跳过）
         try {
@@ -177,7 +180,7 @@ public class KnowPostServiceImpl implements KnowPostService {
                 Map.of("entity", "knowpost", "op", "upsert", "id", id)
         );
 
-        invalidateCache(id);
+        invalidateCacheAfterCommit(id);
     }
 
     /**
@@ -203,6 +206,9 @@ public class KnowPostServiceImpl implements KnowPostService {
                 Map.of("entity", "knowpost", "op", "upsert", "id", id)
         );
 
+        // 新发布内容尚未建立反向索引，需要在事务提交后主动失效公共 Feed
+        invalidateCacheAfterCommit(id);
+
         // 发布成功后触发一次预索引，减少首次问答冷启动
         try {
             ragIndexService.ensureIndexed(id);
@@ -224,7 +230,7 @@ public class KnowPostServiceImpl implements KnowPostService {
             throw new BusinessException(ErrorCode.BAD_REQUEST, "草稿不存在或无权限");
         }
 
-        invalidateCache(id);
+        invalidateCacheAfterCommit(id);
     }
 
     /**
@@ -244,7 +250,7 @@ public class KnowPostServiceImpl implements KnowPostService {
             throw new BusinessException(ErrorCode.BAD_REQUEST, "草稿不存在或无权限");
         }
 
-        invalidateCache(id);
+        invalidateCacheAfterCommit(id);
     }
 
     /**
@@ -268,7 +274,7 @@ public class KnowPostServiceImpl implements KnowPostService {
                 Map.of("entity", "knowpost", "op", "delete", "id", id)
         );
 
-        invalidateCache(id);
+        invalidateCacheAfterCommit(id);
     }
 
     private boolean isValidVisible(String visible) {
@@ -555,6 +561,24 @@ public class KnowPostServiceImpl implements KnowPostService {
         }
     }
 
+    /**
+     * 将第二次缓存失效延后到事务提交成功之后执行。
+     * 单元测试或非事务调用没有激活同步器时，直接执行失效。
+     */
+    private void invalidateCacheAfterCommit(long id) {
+        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
+            invalidateCache(id);
+            return;
+        }
+
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                invalidateCache(id);
+            }
+        });
+    }
+
     private void invalidateCache(long id) {
         String pageKey = "knowpost:detail:" + id + ":v" + DETAIL_LAYOUT_VER;
 
@@ -571,31 +595,91 @@ public class KnowPostServiceImpl implements KnowPostService {
         }
 
         try {
-            invalidateFeedLocalCache(id);
+            invalidateFeedCaches(id);
         } catch (Exception e) {
-            log.warn("Feed 本地缓存清理失败，id={}，将依赖 TTL 自动过期", id, e);
+            log.warn("Feed 缓存清理失败，id={}，将依赖 TTL 自动过期", id, e);
         }
     }
 
-    private void invalidateFeedLocalCache(long id) {
+    /**
+     * 统一失效公共 Feed 的本地页面、Redis ID 列表、hasMore 和内容片段。
+     * 全局页面索引可以覆盖“新发布内容尚未建立单内容反向索引”的场景。
+     */
+    private void invalidateFeedCaches(long id) {
+        String itemKey = "feed:item:" + id;
+        try {
+            redis.delete(itemKey);
+        } catch (Exception e) {
+            log.warn("Feed 内容片段删除失败，key={}", itemKey, e);
+        }
+
+        try {
+            feedPublicCache.invalidateAll();
+        } catch (Exception e) {
+            log.warn("Feed 本地页面缓存清理失败", e);
+        }
+
+        Set<String> pageKeys = new LinkedHashSet<>();
+        try {
+            Set<String> allPageKeys = redis.opsForSet().members("feed:public:pages");
+            if (allPageKeys != null) {
+                pageKeys.addAll(allPageKeys);
+            }
+        } catch (Exception e) {
+            log.warn("Feed 全局页面索引读取失败", e);
+        }
+
         long hourSlot = System.currentTimeMillis() / 3600000L;
         for (long slot : List.of(hourSlot, hourSlot - 1)) {
             String indexKey = "feed:public:index:" + id + ":" + slot;
             try {
-                Set<String> pageKeys = redis.opsForSet().members(indexKey);
-                if (pageKeys == null || pageKeys.isEmpty()) {
+                Set<String> indexedPageKeys = redis.opsForSet().members(indexKey);
+                if (indexedPageKeys == null || indexedPageKeys.isEmpty()) {
                     continue;
                 }
-                for (String localPageKey : pageKeys) {
+                for (String localPageKey : indexedPageKeys) {
                     if (localPageKey == null || localPageKey.isBlank()) {
                         continue;
                     }
-                    feedPublicCache.invalidate(localPageKey);
+                    pageKeys.add(localPageKey);
                     redis.opsForSet().remove(indexKey, localPageKey);
                 }
             } catch (Exception e) {
-                log.warn("Feed 缓存清理异常，indexKey={}", indexKey, e);
+                log.warn("Feed 反向索引清理异常，indexKey={}", indexKey, e);
             }
+        }
+
+        for (String localPageKey : pageKeys) {
+            if (localPageKey == null || localPageKey.isBlank()) {
+                continue;
+            }
+            for (long slot : List.of(hourSlot, hourSlot - 1)) {
+                invalidateFeedPageFragments(localPageKey, slot);
+            }
+        }
+    }
+
+    private void invalidateFeedPageFragments(String localPageKey, long hourSlot) {
+        String[] parts = localPageKey.split(":");
+        if (parts.length != 5 || !"feed".equals(parts[0]) || !"public".equals(parts[1])) {
+            log.debug("Ignore invalid public Feed page key: {}", localPageKey);
+            return;
+        }
+
+        try {
+            int size = Integer.parseInt(parts[2]);
+            int page = Integer.parseInt(parts[3]);
+            if (size <= 0 || page <= 0) {
+                return;
+            }
+
+            String idsKey = "feed:public:ids:" + size + ":" + hourSlot + ":" + page;
+            redis.delete(idsKey);
+            redis.delete(idsKey + ":hasMore");
+        } catch (NumberFormatException e) {
+            log.debug("Ignore invalid public Feed page key: {}", localPageKey);
+        } catch (Exception e) {
+            log.warn("Feed Redis 页面片段删除失败，pageKey={}，hourSlot={}", localPageKey, hourSlot, e);
         }
     }
 

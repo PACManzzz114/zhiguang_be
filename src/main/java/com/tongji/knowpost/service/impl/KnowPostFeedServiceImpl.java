@@ -338,6 +338,10 @@ public class KnowPostFeedServiceImpl implements KnowPostFeedService {
             idVals.add(String.valueOf(r.getId()));
         }
 
+        // 回源结果应覆盖旧列表，避免 leftPushAll 在残留 key 上追加造成 ID 重复
+        redis.delete(idsKey);
+        redis.delete(hasMoreKey);
+
         if (!idVals.isEmpty()) {
             redis.opsForList().leftPushAll(idsKey, idVals);
             redis.expire(idsKey, frTtl);

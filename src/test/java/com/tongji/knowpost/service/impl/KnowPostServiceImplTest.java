@@ -139,6 +139,30 @@ class KnowPostServiceImplTest {
     }
 
     @Test
+    void publishInvalidatesPublicFeedRedisFragmentsAfterSuccess() {
+        long postId = 777L;
+        long hourSlot = System.currentTimeMillis() / 3600000L;
+        String pageKey = "feed:public:20:1:v1";
+        String currentIdsKey = "feed:public:ids:20:" + hourSlot + ":1";
+        String previousIdsKey = "feed:public:ids:20:" + (hourSlot - 1) + ":1";
+
+        feedPublicCache.put(pageKey, new FeedPageResponse(List.of(), 1, 20, false));
+        when(mapper.publish(postId, 1L)).thenReturn(1);
+        when(setOperations.members("feed:public:pages")).thenReturn(Set.of(pageKey));
+        when(setOperations.members("feed:public:index:" + postId + ":" + hourSlot)).thenReturn(Set.of());
+        when(setOperations.members("feed:public:index:" + postId + ":" + (hourSlot - 1))).thenReturn(Set.of());
+
+        service.publish(1L, postId);
+
+        assertThat(feedPublicCache.getIfPresent(pageKey)).isNull();
+        verify(redis).delete("feed:item:" + postId);
+        verify(redis).delete(currentIdsKey);
+        verify(redis).delete(currentIdsKey + ":hasMore");
+        verify(redis).delete(previousIdsKey);
+        verify(redis).delete(previousIdsKey + ":hasMore");
+    }
+
+    @Test
     void updateMetadataInvalidatesLocalPublicFeedForCurrentAndPreviousHour() {
         long postId = 123L;
         long hourSlot = System.currentTimeMillis() / 3600000L;
@@ -146,6 +170,8 @@ class KnowPostServiceImplTest {
         String previousIndexKey = "feed:public:index:" + postId + ":" + (hourSlot - 1);
         String currentPageKey = "feed:public:20:1:v1";
         String previousPageKey = "feed:public:20:2:v1";
+        String currentIdsKey = "feed:public:ids:20:" + hourSlot + ":1";
+        String previousIdsKey = "feed:public:ids:20:" + (hourSlot - 1) + ":2";
 
         feedPublicCache.put(currentPageKey, new FeedPageResponse(List.of(), 1, 20, false));
         feedPublicCache.put(previousPageKey, new FeedPageResponse(List.of(), 2, 20, false));
@@ -160,6 +186,11 @@ class KnowPostServiceImplTest {
         assertThat(feedPublicCache.getIfPresent(previousPageKey)).isNull();
         verify(setOperations, never()).remove(eq(currentIndexKey), eq(""));
         verify(redis, times(2)).delete("knowpost:detail:" + postId + ":v1");
+        verify(redis, times(2)).delete("feed:item:" + postId);
+        verify(redis, times(2)).delete(currentIdsKey);
+        verify(redis, times(2)).delete(currentIdsKey + ":hasMore");
+        verify(redis, times(2)).delete(previousIdsKey);
+        verify(redis, times(2)).delete(previousIdsKey + ":hasMore");
     }
 
     @Test
