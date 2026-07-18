@@ -122,12 +122,48 @@ public class CounterServiceImpl implements CounterService {
         boolean ok = changed == 1L;
         if (ok) {
             int delta = add ? 1 : -1;
+            CounterEvent event = CounterEvent.of(etype, eid, metric, idx, uid, delta);
             // 产出计数事件（异步聚合），分区按实体维度保证同实体事件顺序
-            eventProducer.publish(CounterEvent.of(etype, eid, metric, idx, uid, delta));
+            publishCounterEvent(event);
             // 本地事件：触发缓存失效/旁路更新等快速路径
-            eventPublisher.publishEvent(CounterEvent.of(etype, eid, metric, idx, uid, delta));
+            eventPublisher.publishEvent(event);
         }
         return ok;
+    }
+
+    /**
+     * 监听 Kafka 异步发送结果。Producer 内部重试耗尽后，将该指标标记为脏并废弃 SDS 快照。
+     */
+    void publishCounterEvent(CounterEvent event) {
+        try {
+            eventProducer.publish(event).whenComplete((result, error) -> {
+                if (error != null) {
+                    handleCounterEventDeliveryFailure(event, error);
+                }
+            });
+        } catch (Exception error) {
+            handleCounterEventDeliveryFailure(event, error);
+        }
+    }
+
+    void handleCounterEventDeliveryFailure(CounterEvent event, Throwable error) {
+        String dirtyKey = CounterKeys.dirtyKey(event.getMetric(), event.getEntityType(), event.getEntityId());
+        String sdsKey = CounterKeys.sdsKey(event.getEntityType(), event.getEntityId());
+        log.error("Counter event delivery failed, mark metric dirty: entityType={}, entityId={}, metric={}, userId={}, delta={}",
+                event.getEntityType(), event.getEntityId(), event.getMetric(), event.getUserId(), event.getDelta(), error);
+
+        try {
+            redis.opsForValue().set(dirtyKey, "1", Duration.ofDays(1));
+        } catch (Exception markError) {
+            log.error("Failed to mark counter metric dirty: key={}", dirtyKey, markError);
+        }
+
+        try {
+            // 同时删除快照，使未检查脏标记的旧路径也不会继续读取已知错误的计数
+            redis.delete(sdsKey);
+        } catch (Exception deleteError) {
+            log.error("Failed to delete stale counter snapshot: key={}", sdsKey, deleteError);
+        }
     }
 
     /**
@@ -140,12 +176,13 @@ public class CounterServiceImpl implements CounterService {
         int expectedLen = CounterSchema.SCHEMA_LEN * CounterSchema.FIELD_SIZE;
         // SDS 固定结构：按大端 32 位编码
         byte[] raw = getRaw(sdsKey);
-        boolean needRebuild = (raw == null || raw.length != expectedLen);
+        boolean validSnapshot = raw != null && raw.length == expectedLen;
+        boolean needRebuild = !validSnapshot || hasDirtyMetric(entityType, entityId, metrics);
 
         Map<String, Long> result = new LinkedHashMap<>();
 
         if (needRebuild) {
-            log.info("计数结构不存在，需要重建");
+            log.info("计数快照缺失、结构异常或存在脏标记，需要重建");
             // 限流与指数退避：避免在热点实体上触发重建风暴
             if (inBackoff(entityType, entityId)) {
                 for (String m : metrics) {
@@ -178,23 +215,41 @@ public class CounterServiceImpl implements CounterService {
                     return result;
                 }
                 // 依据位图分片统计真实计数（仅由持锁者执行重建）
-                byte[] newSds = new byte[expectedLen];
+                // SDS 整体缺失时重建全部已支持指标；仅脏标记时保留其他已有字段
+                List<String> metricsToRebuild = validSnapshot
+                        ? metrics
+                        : new ArrayList<>(CounterSchema.SUPPORTED_METRICS);
+                byte[] newSds = validSnapshot
+                        ? Arrays.copyOf(raw, expectedLen)
+                        : new byte[expectedLen];
                 List<String> rebuildFields = new ArrayList<>();
-                for (String m : metrics) {
+                List<String> rebuiltMetrics = new ArrayList<>();
+                Map<String, Long> rebuiltCounts = new HashMap<>();
+                for (String m : metricsToRebuild) {
                     Integer idx = CounterSchema.NAME_TO_IDX.get(m);
                     if (idx == null) {
                         continue;
                     }
                     long sum = bitCountShardsPipelined(m, entityType, entityId);
                     writeInt32BE(newSds, idx * CounterSchema.FIELD_SIZE, sum);
-                    result.put(m, sum);
+                    rebuiltCounts.put(m, sum);
                     rebuildFields.add(String.valueOf(idx));
+                    rebuiltMetrics.add(m);
                 }
                 // 回写SDS并清理聚合桶，避免重复加算
                 setRaw(sdsKey, newSds);
                 if (!rebuildFields.isEmpty()) {
                     String aggKey = CounterKeys.aggKey(entityType, entityId);
                     redis.opsForHash().delete(aggKey, rebuildFields.toArray());
+                }
+                for (String metric : rebuiltMetrics) {
+                    redis.delete(CounterKeys.dirtyKey(metric, entityType, entityId));
+                }
+                for (String metric : metrics) {
+                    Long value = rebuiltCounts.get(metric);
+                    if (value != null) {
+                        result.put(metric, value);
+                    }
                 }
                 resetBackoff(entityType, entityId);
             } catch (InterruptedException ie) {
@@ -261,7 +316,9 @@ public class CounterServiceImpl implements CounterService {
             byte[] raw = (rawObj instanceof byte[]) ? (byte[]) rawObj : null;
 
             Map<String, Long> m = new LinkedHashMap<>();
-            if (raw != null && raw.length == expectedLen) {
+            if (hasDirtyMetric(entityType, eid, metrics)) {
+                m.putAll(getCounts(entityType, eid, metrics));
+            } else if (raw != null && raw.length == expectedLen) {
                 for (String name : metrics) {
                     Integer idx = CounterSchema.NAME_TO_IDX.get(name);
                     if (idx == null) continue;
@@ -277,6 +334,15 @@ public class CounterServiceImpl implements CounterService {
             out.put(eid, m);
         }
         return out;
+    }
+
+    private boolean hasDirtyMetric(String entityType, String entityId, List<String> metrics) {
+        for (String metric : metrics) {
+            if (Boolean.TRUE.equals(redis.hasKey(CounterKeys.dirtyKey(metric, entityType, entityId)))) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

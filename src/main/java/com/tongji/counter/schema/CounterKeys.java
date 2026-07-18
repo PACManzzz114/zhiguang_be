@@ -19,4 +19,9 @@ public final class CounterKeys {
     public static String aggKey(String entityType, String entityId) {
         return String.format("agg:%s:%s:%s", CounterSchema.SCHEMA_ID, entityType, entityId); // 刷写前的增量存储桶
     }
+
+    // Kafka 事件最终投递失败标记，读取时强制按 Bitmap 事实重建该指标
+    public static String dirtyKey(String metric, String entityType, String entityId) {
+        return String.format("dirty:cnt:%s:%s:%s:%s", CounterSchema.SCHEMA_ID, metric, entityType, entityId);
+    }
 }
