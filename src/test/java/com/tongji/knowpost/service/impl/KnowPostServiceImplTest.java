@@ -12,7 +12,7 @@ import com.tongji.knowpost.api.dto.KnowPostDetailResponse;
 import com.tongji.knowpost.id.SnowflakeIdGenerator;
 import com.tongji.knowpost.mapper.KnowPostMapper;
 import com.tongji.llm.rag.RagIndexService;
-import com.tongji.relation.outbox.OutboxMapper;
+import com.tongji.relation.outbox.OutboxEventWriter;
 import com.tongji.storage.config.OssProperties;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -27,12 +27,14 @@ import java.util.List;
 import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -56,7 +58,7 @@ class KnowPostServiceImplTest {
     @Mock
     private RagIndexService ragIndexService;
     @Mock
-    private OutboxMapper outboxMapper;
+    private OutboxEventWriter outboxEventWriter;
 
     private Cache<String, FeedPageResponse> feedPublicCache;
     private Cache<String, KnowPostDetailResponse> knowPostDetailCache;
@@ -85,9 +87,38 @@ class KnowPostServiceImplTest {
                 knowPostDetailCache,
                 hotKeyDetector,
                 ragIndexService,
-                outboxMapper
+                outboxEventWriter
         );
 
+    }
+
+    @Test
+    void updateMetadataPropagatesOutboxWriteFailure() {
+        long postId = 321L;
+        when(mapper.updateMetadata(any())).thenReturn(1);
+        doThrow(new IllegalStateException("outbox unavailable"))
+                .when(outboxEventWriter)
+                .write(
+                        anyLong(),
+                        eq("knowpost"),
+                        eq(postId),
+                        eq("KnowPostMetadataUpdated"),
+                        any()
+                );
+
+        assertThatThrownBy(() -> service.updateMetadata(
+                1L,
+                postId,
+                "title",
+                null,
+                List.of(),
+                List.of(),
+                "public",
+                false,
+                "desc"
+        ))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessage("outbox unavailable");
     }
 
     @Test

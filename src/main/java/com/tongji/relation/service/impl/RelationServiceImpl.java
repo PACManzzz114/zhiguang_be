@@ -2,9 +2,8 @@ package com.tongji.relation.service.impl;
 
 import com.tongji.relation.mapper.RelationMapper;
 import com.tongji.relation.service.RelationService;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import com.tongji.relation.event.RelationEvent;
-import com.tongji.relation.outbox.OutboxMapper;
+import com.tongji.relation.outbox.OutboxEventWriter;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Service;
@@ -40,10 +39,9 @@ import org.springframework.data.redis.core.RedisCallback;
 @Service
 public class RelationServiceImpl implements RelationService {
     private final RelationMapper mapper;
-    private final OutboxMapper outboxMapper;
+    private final OutboxEventWriter outboxEventWriter;
     private final StringRedisTemplate redis;
     private final DefaultRedisScript<Long> tokenScript;
-    private final ObjectMapper objectMapper;
     private final Cache<Long, List<Long>> flwsTopCache;
     private final Cache<Long, List<Long>> fansTopCache;
     private final UserMapper userMapper;
@@ -52,19 +50,16 @@ public class RelationServiceImpl implements RelationService {
     /**
      * 关系服务实现构造函数。
      * @param mapper 关系表数据访问
-     * @param outboxMapper Outbox 事件写入访问
+     * @param outboxEventWriter Outbox 事件统一写入器
      * @param redis Redis 客户端
-     * @param objectMapper JSON 序列化器
      */
     public RelationServiceImpl(RelationMapper mapper,
-                               OutboxMapper outboxMapper,
+                               OutboxEventWriter outboxEventWriter,
                                StringRedisTemplate redis,
-                               ObjectMapper objectMapper,
                                UserMapper userMapper) {
         this.mapper = mapper;
-        this.outboxMapper = outboxMapper;
+        this.outboxEventWriter = outboxEventWriter;
         this.redis = redis;
-        this.objectMapper = objectMapper;
         this.tokenScript = new DefaultRedisScript<>();
         this.tokenScript.setResultType(Long.class);
         this.tokenScript.setScriptText(TOKEN_BUCKET_LUA);
@@ -92,11 +87,14 @@ public class RelationServiceImpl implements RelationService {
         int inserted = mapper.insertFollowing(id, fromUserId, toUserId, 1);
 
         if (inserted > 0) {
-            try {
-                Long outId = ThreadLocalRandom.current().nextLong(Long.MAX_VALUE);
-                String payload = objectMapper.writeValueAsString(new RelationEvent("FollowCreated", fromUserId, toUserId, id));
-                outboxMapper.insert(outId, "following", id, "FollowCreated", payload);
-            } catch (Exception ignored) {}
+            Long outId = ThreadLocalRandom.current().nextLong(Long.MAX_VALUE);
+            outboxEventWriter.write(
+                    outId,
+                    "following",
+                    id,
+                    "FollowCreated",
+                    new RelationEvent("FollowCreated", fromUserId, toUserId, id)
+            );
 
             return true;
         }
@@ -114,11 +112,14 @@ public class RelationServiceImpl implements RelationService {
     public boolean unfollow(long fromUserId, long toUserId) {
         int updated = mapper.cancelFollowing(fromUserId, toUserId);
         if (updated > 0) {
-            try {
-                Long outId = ThreadLocalRandom.current().nextLong(Long.MAX_VALUE);
-                String payload = objectMapper.writeValueAsString(new RelationEvent("FollowCanceled", fromUserId, toUserId, null));
-                outboxMapper.insert(outId, "following", null, "FollowCanceled", payload);
-            } catch (Exception ignored) {}
+            Long outId = ThreadLocalRandom.current().nextLong(Long.MAX_VALUE);
+            outboxEventWriter.write(
+                    outId,
+                    "following",
+                    null,
+                    "FollowCanceled",
+                    new RelationEvent("FollowCanceled", fromUserId, toUserId, null)
+            );
             return true;
         }
         return false;
