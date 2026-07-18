@@ -37,3 +37,13 @@ build/
 
 ### Mac OS ###
 .DS_Store
+
+### Local application configuration ###
+# Keep real credentials and environment-specific settings out of Git.
+src/main/resources/application.yml
+src/main/resources/application-local.yml
+src/main/resources/application-*.yml
+!src/main/resources/application-example.yml
+
+**/private.pem
+.idea/
