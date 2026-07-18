@@ -23,8 +23,10 @@ import org.springframework.data.redis.core.SetOperations;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.ValueOperations;
 
+import java.lang.reflect.Field;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -69,7 +71,7 @@ class KnowPostServiceImplTest {
         feedPublicCache = Caffeine.newBuilder().build();
         knowPostDetailCache = Caffeine.newBuilder().build();
 
-        when(redis.opsForSet()).thenReturn(setOperations);
+        lenient().when(redis.opsForSet()).thenReturn(setOperations);
 
         CacheProperties cacheProperties = new CacheProperties();
         HotKeyDetector hotKeyDetector = new HotKeyDetector(cacheProperties);
@@ -90,6 +92,21 @@ class KnowPostServiceImplTest {
                 outboxEventWriter
         );
 
+    }
+
+    @Test
+    void getDetailReleasesSingleFlightEntryWhenDatabaseFallbackFails() throws Exception {
+        long postId = 654L;
+        when(redis.opsForValue()).thenReturn(valueOperations);
+        when(mapper.findDetailById(postId))
+                .thenThrow(new IllegalStateException("database unavailable"));
+
+        assertThatThrownBy(() -> service.getDetail(postId, null))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessage("database unavailable");
+
+        assertThat(singleFlightEntries()).isEmpty();
+        verify(mapper).findDetailById(postId);
     }
 
     @Test
@@ -403,5 +420,12 @@ class KnowPostServiceImplTest {
         verify(setOperations, never()).remove(anyString(), anyString());
 
         System.out.println("\n🎉 [结论] 空Set优雅处理！不会触发多余的网络请求\n");
+    }
+
+    @SuppressWarnings("unchecked")
+    private ConcurrentHashMap<String, Object> singleFlightEntries() throws Exception {
+        Field field = KnowPostServiceImpl.class.getDeclaredField("singleFlight");
+        field.setAccessible(true);
+        return (ConcurrentHashMap<String, Object>) field.get(service);
     }
 }

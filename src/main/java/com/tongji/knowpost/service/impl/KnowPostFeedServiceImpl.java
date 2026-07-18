@@ -131,52 +131,54 @@ public class KnowPostFeedServiceImpl implements KnowPostFeedService {
         // 为了防止高并发下（例如 1000 个请求同时访问同一页）
         // 所有请求同时打到数据库（造成 缓存击穿 ），这里使用了锁
         // 单航班机制：以 idsKey 作为“航班号”
-        // 并发下同一页只允许一个请求回源数据库，其余在锁内优先重查缓存，避免击穿惊群
+        // 单实例内同一页只允许一个请求回源数据库，其余在锁内优先重查缓存
         Object lock = singleFlight.computeIfAbsent(idsKey, k -> new Object());
         synchronized (lock) {
-            // 重查 L2 缓存，避免重复回源
-            FeedPageResponse again = assembleFromCache(idsKey, hasMoreKey, safePage, safeSize, currentUserIdNullable);
-            if (again != null) {
-                feedPublicCache.put(localPageKey, again);
-                // 对返回列表中的每个条目进行热度统计
-                if (again.items() != null) {
-                    for (FeedItemResponse item : again.items()) {
-                        recordItemHotKey(item.id());
+            try {
+                // 重查 L2 缓存，避免重复回源
+                FeedPageResponse again = assembleFromCache(idsKey, hasMoreKey, safePage, safeSize, currentUserIdNullable);
+                if (again != null) {
+                    feedPublicCache.put(localPageKey, again);
+                    // 对返回列表中的每个条目进行热度统计
+                    if (again.items() != null) {
+                        for (FeedItemResponse item : again.items()) {
+                            recordItemHotKey(item.id());
+                        }
                     }
+                    log.info("feed.public source=3tier(after-flight) localPageKey={} page={} size={}", localPageKey, safePage, safeSize);
+                    return again;
                 }
-                log.info("feed.public source=3tier(after-flight) localPageKey={} page={} size={}", localPageKey, safePage, safeSize);
-                singleFlight.remove(idsKey);
-                return again;
+
+                // 数据库回源：读取 size+1 以判断是否有下一页，后裁剪为当前页
+                int offset = (safePage - 1) * safeSize;
+                List<KnowPostFeedRow> rows = mapper.listFeedPublic(safeSize + 1, offset);
+                boolean hasMore = rows.size() > safeSize;
+                if (hasMore) {
+                    rows = rows.subList(0, safeSize);
+                }
+
+                // 构建基础列表（计数已填充），liked/faved 置为 null 以免污染用户维度缓存
+                List<FeedItemResponse> items = mapRowsToItems(rows, null, false);
+
+                FeedPageResponse respForCache = new FeedPageResponse(items, safePage, safeSize, hasMore);
+                // 片段缓存（ids/item/count）TTL 更长并加入随机抖动，降低同一时刻大量过期
+                int baseTtl = 60;
+                int jitter = ThreadLocalRandom.current().nextInt(30);
+                Duration frTtl = Duration.ofSeconds(baseTtl + jitter);
+
+                // 写入片段缓存与本地缓存
+                writeCaches(localPageKey, idsKey, hasMoreKey, safeSize, rows, items, hasMore, frTtl);
+                feedPublicCache.put(localPageKey, respForCache);
+
+                // 返回时覆盖用户维度状态，不写回缓存
+                List<FeedItemResponse> enriched = enrich(items, currentUserIdNullable);
+                log.info("feed.public source=db localPageKey={} page={} size={} hasMore={}", localPageKey, safePage, safeSize, hasMore);
+
+                return new FeedPageResponse(enriched, safePage, safeSize, hasMore);
+            } finally {
+                // Redis、数据库或序列化异常时也必须释放航班，避免锁对象长期滞留
+                singleFlight.remove(idsKey, lock);
             }
-
-            // 数据库回源：读取 size+1 以判断是否有下一页，后裁剪为当前页
-            int offset = (safePage - 1) * safeSize;
-            List<KnowPostFeedRow> rows = mapper.listFeedPublic(safeSize + 1, offset);
-            boolean hasMore = rows.size() > safeSize;
-            if (hasMore) {
-                rows = rows.subList(0, safeSize);
-            }
-
-            // 构建基础列表（计数已填充），liked/faved 置为 null 以免污染用户维度缓存
-            List<FeedItemResponse> items = mapRowsToItems(rows, null, false);
-
-            FeedPageResponse respForCache = new FeedPageResponse(items, safePage, safeSize, hasMore);
-            // 片段缓存（ids/item/count）TTL 更长并加入随机抖动，降低同一时刻大量过期
-            int baseTtl = 60;
-            int jitter = ThreadLocalRandom.current().nextInt(30);
-            Duration frTtl = Duration.ofSeconds(baseTtl + jitter);
-
-            // 写入片段缓存与本地缓存
-            writeCaches(localPageKey, idsKey, hasMoreKey, safeSize, rows, items, hasMore, frTtl);
-            feedPublicCache.put(localPageKey, respForCache);
-
-            // 返回时覆盖用户维度状态，不写回缓存
-            List<FeedItemResponse> enriched = enrich(items, currentUserIdNullable);
-            log.info("feed.public source=db localPageKey={} page={} size={} hasMore={}", localPageKey, safePage, safeSize, hasMore);
-            // 释放单航班锁，允许后续请求正常进入
-            singleFlight.remove(idsKey);
-
-            return new FeedPageResponse(enriched, safePage, safeSize, hasMore);
         }
     }
 

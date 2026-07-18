@@ -345,97 +345,91 @@ public class KnowPostServiceImpl implements KnowPostService {
         }
 
         // 3. 缓存未命中，进入 SingleFlight 模式
-        // 对同一个 pageKey 加锁，防止高并发下大量请求同时打到数据库（缓存击穿/惊群效应）
+        // 对同一个 pageKey 加 JVM 内锁，防止单实例内大量请求同时打到数据库
         Object lock = singleFlight.computeIfAbsent(pageKey, k -> new Object());
         synchronized (lock) {
-            // 4. 双重检查（Double Check）
-            // 在获取锁后，再次检查缓存，因为在排队等待锁的过程中，前一个请求可能已经把数据写入缓存了
-            String again = redis.opsForValue().get(pageKey);
             try {
+                // 4. 双重检查（Double Check）
+                // 在获取锁后，再次检查缓存，因为在排队等待锁的过程中，前一个请求可能已经把数据写入缓存了
+                String again = redis.opsForValue().get(pageKey);
                 resp = tryProcessCacheHit(again, id, pageKey, currentUserIdNullable, "page(after-flight)");
-            } catch (BusinessException e) {
-                // 如果缓存中明确记录了 "NULL"（即内容不存在），则直接抛出异常，不再查库
-                singleFlight.remove(pageKey);
-                throw e;
+                if (resp != null) {
+                    // 缓存已由其他线程填充，直接返回
+                    return resp;
+                }
+
+                // 5. 数据库回源查询
+                KnowPostDetailRow row = mapper.findDetailById(id);
+
+                // 6. 处理内容不存在或已删除的情况
+                // 写入 "NULL" 空值缓存，防止缓存穿透（查询不存在的数据导致一直打数据库）
+                if (row == null || "deleted".equals(row.getStatus())) {
+                    redis.opsForValue().set(pageKey, "NULL", java.time.Duration.ofSeconds(30 + java.util.concurrent.ThreadLocalRandom.current().nextInt(31)));
+                    throw new BusinessException(ErrorCode.BAD_REQUEST, "内容不存在");
+                }
+
+                // 7. 权限校验
+                // 公开策略：状态为 published 且可见性为 public 的内容可直接访问
+                // 私有策略：否则仅作者本人可见
+                boolean isPublic = "published".equals(row.getStatus()) && "public".equals(row.getVisible());
+                boolean isOwner = currentUserIdNullable != null && row.getCreatorId() != null && currentUserIdNullable.equals(row.getCreatorId());
+                if (!isPublic && !isOwner) {
+                    throw new BusinessException(ErrorCode.BAD_REQUEST, "无权限查看");
+                }
+
+                // 8. 组装响应对象
+                // 解析图片和标签 JSON
+                List<String> images = parseStringArray(row.getImgUrls());
+                List<String> tags = parseStringArray(row.getTags());
+
+                // 此处查询的计数仅作为缓存的基础值，后续 enrich 会刷新
+                Map<String, Long> counts = counterService.getCounts("knowpost", String.valueOf(row.getId()), List.of("like", "fav"));
+                Long likeCount = counts.getOrDefault("like", 0L);
+                Long favoriteCount = counts.getOrDefault("fav", 0L);
+
+                resp = new KnowPostDetailResponse(
+                        String.valueOf(row.getId()),
+                        row.getTitle(),
+                        row.getDescription(),
+                        row.getContentUrl(),
+                        images,
+                        tags,
+                        String.valueOf(row.getCreatorId()),
+                        row.getAuthorAvatar(),
+                        row.getAuthorNickname(),
+                        row.getAuthorTagJson(),
+                        likeCount,
+                        favoriteCount,
+                        null, // liked 状态暂时留空，由 enrich 填充
+                        null, // faved 状态暂时留空，由 enrich 填充
+                        row.getIsTop(),
+                        row.getVisible(),
+                        row.getType(),
+                        row.getPublishTime()
+                );
+
+                // 9. 写入 Redis 缓存
+                try {
+                    String json = objectMapper.writeValueAsString(resp);
+                    int baseTtl = 60;
+                    // 增加随机抖动（Jitter），防止大量缓存同时过期（雪崩）
+                    int jitter = ThreadLocalRandom.current().nextInt(30);
+                    // 根据热度检测结果动态调整 TTL，热点内容缓存时间更长
+                    int target = hotKey.ttlForPublic(baseTtl, pageKey);
+                    redis.opsForValue().set(pageKey, json, Duration.ofSeconds(Math.max(target, baseTtl + jitter)));
+
+                    // L1 填充
+                    knowPostDetailCache.put(pageKey, resp);
+
+                    log.info("detail source=db key={}", pageKey);
+                } catch (Exception ignored) {}
+
+                // 10. 返回前调用 enrich 填充用户维度的 liked/faved 状态
+                return enrichDetailResponse(resp, currentUserIdNullable, false);
+            } finally {
+                // 任何异常路径都必须释放航班，避免锁对象长期滞留
+                singleFlight.remove(pageKey, lock);
             }
-            if (resp != null) {
-                // 缓存已由其他线程填充，直接返回
-                singleFlight.remove(pageKey);
-                return resp;
-            }
-
-            // 5. 数据库回源查询
-            KnowPostDetailRow row = mapper.findDetailById(id);
-            
-            // 6. 处理内容不存在或已删除的情况
-            // 写入 "NULL" 空值缓存，防止缓存穿透（查询不存在的数据导致一直打数据库）
-            if (row == null || "deleted".equals(row.getStatus())) {
-                redis.opsForValue().set(pageKey, "NULL", java.time.Duration.ofSeconds(30 + java.util.concurrent.ThreadLocalRandom.current().nextInt(31)));
-                singleFlight.remove(pageKey);
-                throw new BusinessException(ErrorCode.BAD_REQUEST, "内容不存在");
-            }
-
-            // 7. 权限校验
-            // 公开策略：状态为 published 且可见性为 public 的内容可直接访问
-            // 私有策略：否则仅作者本人可见
-            boolean isPublic = "published".equals(row.getStatus()) && "public".equals(row.getVisible());
-            boolean isOwner = currentUserIdNullable != null && row.getCreatorId() != null && currentUserIdNullable.equals(row.getCreatorId());
-            if (!isPublic && !isOwner) {
-                singleFlight.remove(pageKey);
-                throw new BusinessException(ErrorCode.BAD_REQUEST, "无权限查看");
-            }
-
-            // 8. 组装响应对象
-            // 解析图片和标签 JSON
-            List<String> images = parseStringArray(row.getImgUrls());
-            List<String> tags = parseStringArray(row.getTags());
-            
-            // 此处查询的计数仅作为缓存的基础值，后续 enrich 会刷新
-            Map<String, Long> counts = counterService.getCounts("knowpost", String.valueOf(row.getId()), List.of("like", "fav"));
-            Long likeCount = counts.getOrDefault("like", 0L);
-            Long favoriteCount = counts.getOrDefault("fav", 0L);
-
-            resp = new KnowPostDetailResponse(
-                    String.valueOf(row.getId()),
-                    row.getTitle(),
-                    row.getDescription(),
-                    row.getContentUrl(),
-                    images,
-                    tags,
-                    String.valueOf(row.getCreatorId()),
-                    row.getAuthorAvatar(),
-                    row.getAuthorNickname(),
-                    row.getAuthorTagJson(),
-                    likeCount,
-                    favoriteCount,
-                    null, // liked 状态暂时留空，由 enrich 填充
-                    null, // faved 状态暂时留空，由 enrich 填充
-                    row.getIsTop(),
-                    row.getVisible(),
-                    row.getType(),
-                    row.getPublishTime()
-            );
-
-            // 9. 写入 Redis 缓存
-            try {
-                String json = objectMapper.writeValueAsString(resp);
-                int baseTtl = 60;
-                // 增加随机抖动（Jitter），防止大量缓存同时过期（雪崩）
-                int jitter = ThreadLocalRandom.current().nextInt(30);
-                // 根据热度检测结果动态调整 TTL，热点内容缓存时间更长
-                int target = hotKey.ttlForPublic(baseTtl, pageKey);
-                redis.opsForValue().set(pageKey, json, Duration.ofSeconds(Math.max(target, baseTtl + jitter)));
-
-                // L1 填充
-                knowPostDetailCache.put(pageKey, resp);
-
-                log.info("detail source=db key={}", pageKey);
-            } catch (Exception ignored) {}
-
-            // 10. 释放锁并返回最终结果
-            // 返回前调用 enrich 填充用户维度的 liked/faved 状态
-            singleFlight.remove(pageKey);
-            return enrichDetailResponse(resp, currentUserIdNullable, false);
         }
     }
 
